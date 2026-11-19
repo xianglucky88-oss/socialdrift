@@ -1,11 +1,12 @@
 """Local transport, parsing, storage, and session helpers."""
 from __future__ import annotations
-import hashlib
 import importlib
 import json
+import uuid
 
 from lxml import html as _lh
 
+from . import timeline
 from .config import SPEC
 from .store import Store
 
@@ -137,17 +138,17 @@ def fetch_all(http: Http):
 # Record identity helpers.
 # --------------------------------------------------------------------------- #
 def canonical(d):
-    return json.dumps(d, sort_keys=True, ensure_ascii=False)
+    return timeline.canonical(d)
 
 
 def content_hash(d):
-    return hashlib.sha256(canonical(d).encode()).hexdigest()[:24]
+    return timeline.content_hash(d)
 
 
 def dedup(records):
     seen, out, dup = set(), [], 0
     for r in records:
-        h = content_hash(r)
+        h = timeline.content_hash(r)
         if h in seen:
             dup += 1
             continue
@@ -160,6 +161,8 @@ def normalize(r):
     d = {k: (v.strip() if isinstance(v, str) else v) for k, v in r.items()}
     if isinstance(d.get("status"), str):
         d["status"] = d["status"].lower()
+    if SPEC.ts_field in d:
+        d[SPEC.ts_field] = timeline.norm_ts(d[SPEC.ts_field])
     return d
 
 
@@ -168,15 +171,48 @@ def _apply_kernel(records):
     for r in records:
         if hasattr(k, "process"):
             r.update(k.process(r))
-    if hasattr(k, "reduce"):
-        records = k.reduce(records)
+    # ``reduce`` is intentionally not run before storage: chain annotations
+    # are batch-local conclusions and must be recomputed from all revisions.
+
     return records
+
+
+def _order_for(pair):
+    """Canonical occurrence order of one observation (never arrival order)."""
+    raw, record = pair
+    return timeline.order_key({
+        "valid_from": record.get(SPEC.ts_field, ""),
+        "kind": timeline.kind_for(record),
+        "event_id": str(record.get("id", "")),
+        "raw_payload": raw,
+    })
+
+
+def _stable_ingest(store, pairs, *, batch_id, recorded_at, mode):
+    """Persist observations idempotently, in canonical occurrence order.
+
+    ``pairs`` are ``(raw, normalized)`` tuples.  Identity is computed from
+    the raw source row, so a rule change or a migration cannot create a new
+    revision for evidence that was already received.  The whole batch is one
+    transaction: a partial failure leaves no partial history behind, and a
+    rerun can resume exactly where it stopped.
+    """
+    ordered = sorted(pairs, key=_order_for)
+    ingested = 0
+    with store.atomic():
+        for source_order, (raw, record) in enumerate(ordered):
+            created = store.upsert(
+                record, raw=raw, batch_id=batch_id, recorded_at=recorded_at,
+                source_order=source_order, origin=mode, attempts=None,
+                commit=False)
+            ingested += 1 if created else 0
+    return ingested
 
 
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
-def run(mode="full", con=None):
+def run(mode="full", con=None, recorded_at=None):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
@@ -185,20 +221,57 @@ def run(mode="full", con=None):
     try:
         records, attempts = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
-        norm, dup_in_batch = dedup(norm)
-        norm = _apply_kernel(norm)
 
+        # Keep the raw evidence paired with the normalized view *before* any
+        # rule runs.  Identity is computed from the pair's raw half, so a
+        # change in normalization/kernel rules cannot alter what was observed.
+        pairs = []
+        seen = set()
+        dup_in_batch = 0
+        for raw, record in zip(records, norm):
+            key = content_hash(record)
+            if key in seen:
+                dup_in_batch += 1
+                continue
+            seen.add(key)
+            pairs.append((raw, record))
+        norm = _apply_kernel([record for _raw, record in pairs])
+        pairs = [(raw, record) for (raw, _old), record in zip(pairs, norm)]
+
+        batch_id = "%s-%s" % (mode, uuid.uuid4().hex[:12])
+        recorded_at = recorded_at or timeline.now_iso()
         wm = store.watermark()
-        if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
 
-        ingested = sum(1 for r in norm if store.upsert(r))
-        total = store.count()
-        new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
+        # Which records an incremental run is responsible for is still
+        # decided by the existing cursor rule (``ts`` strictly newer than the
+        # watermark), and duplicate counting/parsing are untouched.  What
+        # changes is only the *effect* downstream: skipping a record can no
+        # longer roll history back, because nothing is ever overwritten and
+        # the cursor cannot regress.
+        if mode == "incremental" and wm:
+            selected = [(raw, record) for raw, record in pairs
+                        if timeline.norm_ts(record.get(SPEC.ts_field))
+                        > timeline.norm_ts(wm)]
+        else:
+            selected = pairs
+
+        ingested = _stable_ingest(
+            store, selected, batch_id=batch_id, recorded_at=recorded_at,
+            mode=mode)
+
+        # The watermark advances monotonically from evidence actually
+        # observed in this run, so a late lower timestamp cannot roll it back.
+        observed = [timeline.norm_ts(r.get(SPEC.ts_field, "")) for r in norm
+                    if timeline.norm_ts(r.get(SPEC.ts_field, ""))]
+        new_wm = max(observed + [wm or ""]) if observed else (wm or "")
         if new_wm:
             store.set_watermark(new_wm)
+
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
-                "duplicates": dup_in_batch, "ingested": ingested, "count": total,
+                "duplicates": dup_in_batch,
+                "ingested": ingested, "count": store.count(),
+                "entities": store.entity_count(), "receipts": store.receipt_count(),
+                "batch_id": batch_id,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
                 "watermark": store.watermark()}
     finally:
@@ -273,7 +346,7 @@ class Rpa:
         return bool(data.get("created"))
 
 
-def run_rpa(con=None):
+def run_rpa(con=None, recorded_at=None):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
@@ -282,10 +355,21 @@ def run_rpa(con=None):
         logged = r.login()
         items = r.collect()
         norm = [normalize(dict(it)) for it in items]
-        norm, dup = dedup(norm)
-        norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
-        total = store.count()
+        pairs, seen, dup = [], set(), 0
+        for raw, record in zip(items, norm):
+            key = content_hash(record)
+            if key in seen:
+                dup += 1
+                continue
+            seen.add(key)
+            pairs.append((raw, record))
+        norm = _apply_kernel([record for _raw, record in pairs])
+        pairs = [(raw, record) for (raw, _old), record in zip(pairs, norm)]
+        batch_id = "rpa-%s" % uuid.uuid4().hex[:12]
+        recorded_at = recorded_at or timeline.now_iso()
+        ingested = _stable_ingest(
+            store, pairs, batch_id=batch_id, recorded_at=recorded_at,
+            mode="rpa")
         created = dedup_submit = 0
         for x in norm[:2]:
             if r.submit(x):
@@ -295,12 +379,14 @@ def run_rpa(con=None):
         for x in norm[:1]:
             if not r.submit(x):
                 dedup_submit += 1
-        wm = max([str(x.get("ts", "")) for x in norm] + [""])
+        wm = max([timeline.norm_ts(x.get(SPEC.ts_field, "")) for x in norm] + [""])
         if wm:
             store.set_watermark(wm)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
-                "ingested": ingested, "count": total,
+                "ingested": ingested, "count": store.count(),
+                "entities": store.entity_count(), "receipts": store.receipt_count(),
+                "batch_id": batch_id,
                 "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
     finally:
         if own:

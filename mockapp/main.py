@@ -13,15 +13,24 @@ _extra = []
 _verified_sessions = set()
 _accepted_tokens = set()
 
+# Scenario controls used by the stability tests.
+_fail_pages = {}       # page -> number of remaining forced 500s
+_echo_pages = {}       # page -> page whose content is served instead (dup pages)
+
 def _data():
     return _ALL + _extra
 
 def _page_items(page):
-    lo, hi = (page - 1) * SPEC.page_size, page * SPEC.page_size
+    served = _echo_pages.get(page, page)
+    lo, hi = (served - 1) * SPEC.page_size, served * SPEC.page_size
     return _data()[lo:hi]
 
 @app.get("/items")
 def items(page: int = 1):
+    remaining = _fail_pages.get(page, 0)
+    if remaining > 0:
+        _fail_pages[page] = remaining - 1
+        return Response(status_code=500)
     data = _page_items(page)
     if SPEC.fmt == "json":
         return {"items": data, "page": page}
@@ -90,3 +99,75 @@ async def submit(request: Request):
     if created:
         _accepted_tokens.add(token)
     return {"created": bool(created), "token": token}
+
+
+# --------------------------------------------------------------------------- #
+# Scenario controls: late / out-of-order notifications, duplicate pages,
+# partial failure, and isolated fixture resets.
+# --------------------------------------------------------------------------- #
+@app.post("/source/append")
+async def source_append(request: Request):
+    """Append a raw row exactly as supplied (late or out-of-order delivery)."""
+    row = await request.json()
+    _extra.append(dict(row))
+    return {"total": len(_data()), "appended": row}
+
+
+@app.post("/source/edit")
+async def source_edit(request: Request):
+    """Append an edited revision of an existing row."""
+    body = await request.json()
+    target = body.get("id")
+    change = body.get("record", {})
+    base = next((r for r in _data() if r.get("id") == target), None)
+    if base is None:
+        return Response(status_code=404)
+    row = dict(base)
+    row.update(change)
+    row["id"] = target
+    _extra.append(row)
+    return {"total": len(_data()), "appended": row}
+
+
+@app.post("/source/withdraw")
+async def source_withdraw(request: Request):
+    """Append a withdrawal (retraction) revision of an existing row."""
+    body = await request.json()
+    target = body.get("id")
+    base = next((r for r in _data() if r.get("id") == target), None)
+    if base is None:
+        return Response(status_code=404)
+    row = dict(base)
+    row["status"] = "withdrawn"
+    if body.get("ts"):
+        row["ts"] = body["ts"]
+    _extra.append(row)
+    return {"total": len(_data()), "appended": row}
+
+
+@app.post("/source/echo-page")
+async def source_echo_page(request: Request):
+    """Serve ``page``'s content for another page, simulating pagination drift."""
+    body = await request.json()
+    _echo_pages[int(body["page"])] = int(body["served"])
+    return {"echo": {str(k): v for k, v in _echo_pages.items()}}
+
+
+@app.post("/source/fail-page")
+async def source_fail_page(request: Request):
+    """Force a page to fail ``times`` times (partial-failure scenario)."""
+    body = await request.json()
+    page = int(body["page"])
+    if int(body.get("times", 0)) <= 0:
+        _fail_pages.pop(page, None)
+    else:
+        _fail_pages[page] = int(body["times"])
+    return {"failing": {str(k): v for k, v in _fail_pages.items()}}
+
+
+@app.post("/source/reset")
+async def source_reset():
+    _extra.clear()
+    _fail_pages.clear()
+    _echo_pages.clear()
+    return {"total": len(_data())}
